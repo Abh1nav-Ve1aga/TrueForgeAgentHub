@@ -88,11 +88,7 @@ def process_agent_jobs(agent_name: str, session_id: str) -> None:
         # release lock before waiting for the agent -> allows other workers to run jobs
         try:
             # identify the message's source for the recipient
-            incoming_message = (
-                f"Message ID: {message_id}\n"
-                f"From agent: {sender}\n\n"
-                f"{message}"
-            )
+            incoming_message = f"[Agent: {sender}]\n\n{message}"
 
             run_agent_turn(session_id, incoming_message)
 

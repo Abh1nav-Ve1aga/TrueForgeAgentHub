@@ -1,34 +1,53 @@
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+# library allows await functions without restraining the remaining program
+import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
+from typing import Literal
 from uuid import uuid4
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import FastMCP
+#library for validating data
+from pydantic import BaseModel, Field
 from trueforge_sdk import TrueForge
 from trueforge_sdk.types import UserMessage
 
 
 # servers
-mcp = FastMCP("Agent Communication", host="127.0.0.1", port=8000)
-client = TrueForge(base_url="http://localhost:8790", timeout=600)
+mcp = FastMCP("Agent Delegation", host="127.0.0.1", port=8000)
+client = TrueForge(
+    base_url="http://localhost:8790",
+    timeout=900,
+    max_retries=0,
+)
 
-# protects shared dictionary and queue updates
+# protects shared dictionary updates
 state_lock = Lock()
 
-# prevents duplicate session creation or registration
+# prevents duplicate session creation
 session_creation_lock = Lock()
-
-# message id, sender, message
-QueuedMessage = tuple[str, str, str]
 
 # agent name -> session id
 sessions: dict[str, str] = {}
 
-# agent name -> executor with 1 worker
+# agent name -> executor with 1 worker and its own task queue
 executors: dict[str, ThreadPoolExecutor] = {}
 
-# agent name -> queue while its worker is scheduled or running
-pending: dict[str, deque[QueuedMessage]] = {}
+# caller -> recipient -> number of outstanding assignments
+waiting_on: dict[str, dict[str, int]] = {}
+
+
+# individual assignment supplied by the calling agent
+# Assignment and AgentReply inherits Basemodel -> allowing for arg data validation
+class Assignment(BaseModel):
+    #specify object fields/rules -> in this case string + > 1 char
+    recipient: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+
+
+# expected response from the recipient
+class AgentReply(BaseModel):
+    status: Literal["completed", "needs_input", "failed"]
+    summary: str = Field(min_length=1)
 
 
 # fetch existing agent session or create one
@@ -47,13 +66,29 @@ def get_agent_session(agent_name: str) -> str:
     return session_id
 
 
-# executes one agent turn
-def run_agent_turn(session_id: str, message: str):
+# executes one agent turn -> returns its response
+def run_agent_turn(session_id: str, message: str) -> AgentReply:
     with client.sessions.create_turn_stream(
         session_id=session_id,
         input=[UserMessage(content=message)],
     ) as events:
         for event in events:
+            # turn state updated to pauses for approval or other external input
+            if (
+                event.type == "turn.update"
+                and event.state.status == "paused"
+            ):  
+                #external input/auth needed
+                return AgentReply(
+                    status="needs_input",
+                    summary=(
+                        "TrueForge paused this turn for external input. "
+                        f"Open session {session_id} to inspect and resolve "
+                        "its pending approval, question, or authentication."
+                    ),
+                )
+            
+            # turn updated to done
             if event.type == "turn.done":
                 if event.state.status != "done":
                     raise RuntimeError(
@@ -61,166 +96,227 @@ def run_agent_turn(session_id: str, message: str):
                         f"{event.state.status}"
                     )
 
-                # a completed turn may have no final text
                 if event.state.output is None:
-                    return None
+                    raise RuntimeError(
+                        f"Session {session_id} returned no final response."
+                    )
 
-                return event.state.output.content
+                # validate the recipient's structured response
+                return AgentReply.model_validate_json(
+                    event.state.output.content
+                )
 
     raise RuntimeError(
-        f"Session {session_id} ended without a final event."
+        f"Session {session_id} ended without a final result."
     )
 
 
-# process all messages queued for one agent
-def process_agent_jobs(agent_name: str, session_id: str) -> None:
-    while True:
-        with state_lock:
-            queue = pending[agent_name]
+# check whether an agent already depends on another agent
+"""
+See if the sender, before sending a message, itself needs to respond to an agent.
+Tracing through `waiting_on`, if the sender can find itself, there will be delgation loop (bad).
+The sender should NOT have any returns before delegating
+"""
+def has_wait_path(start: str, target: str) -> bool:
+    remaining = [start]
+    visited: set[str] = set()
 
-            # no more messages -> release this agent's queue
-            if not queue:
-                del pending[agent_name]
-                return
+    # trace through waiting_on (remaining) while tracking visited
+    while remaining:
+        agent = remaining.pop()
 
-            message_id, sender, message = queue.popleft()
+        if agent == target:
+            #infinite loop would exist
+            return True
 
-        # release lock before waiting for the agent -> allows other workers to run jobs
-        try:
-            # identify the message's source for the recipient
-            incoming_message = f"[Agent: {sender}]\n\n{message}"
+        if agent not in visited:
+            visited.add(agent)
+            remaining.extend(waiting_on.get(agent, {}))
 
-            run_agent_turn(session_id, incoming_message)
-
-            print(
-                f"[{message_id}] {sender} -> {agent_name} "
-                f"({session_id}) completed",
-                flush=True,
-            )
-
-        # log failure -> continue processing later messages
-        except Exception as error:
-            print(
-                f"[{message_id}] {sender} -> {agent_name} "
-                f"({session_id}) failed: {error}",
-                flush=True,
-            )
+    #no potential infinite loop
+    return False
 
 
-# send a message without waiting for the recipient's response
-@mcp.tool()
-def communicate(
+# assignment finished -> remove its waiting relationship (waiting_on dict)
+def release_wait(sender: str, recipient: str) -> None:
+    with state_lock:
+        recipients = waiting_on[sender]
+        recipients[recipient] -= 1
+
+        if recipients[recipient] == 0:
+            del recipients[recipient]
+
+        if not recipients:
+            del waiting_on[sender]
+
+
+# worker executes one assignment -> captures success or failure
+def run_assignment(
+    task_id: str,
     sender: str,
     recipient: str,
     message: str,
 ) -> dict[str, str]:
-    """
-    Queue a message using exact TrueForge agent names.
+    session_id = ""
 
-    Returns immediately after submission, without waiting for execution.
-    To reply, call communicate with sender and recipient reversed.
-    A queued status confirms acceptance, not successful completion.
-    """
-    # format
-    sender = sender.strip()
-    recipient = recipient.strip()
+    try:
+        session_id = get_agent_session(recipient)
 
-    #validate basic info
-    if not sender or not recipient or not message.strip():
-        raise ValueError(
-            "Sender, recipient, and message must all be provided."
+        # recipient agent recieives sender, task id, message + skill-usage instructions
+        incoming_message = (
+            f"[Delegated by agent: {sender}]\n"
+            "Carry out and respond via the `handle-delegated-task` skill.\n\n"
+            f"Task ID: {task_id}\n\n"
+            f"{message}"
         )
 
-    # resolve recipient's session -> reused for all incoming messages
-    session_id = get_agent_session(recipient)
+        #recipient agent carries out job -> store reply (AgentReply format)
+        reply = run_agent_turn(session_id, incoming_message)
 
-    message_id = uuid4().hex
-    queued_job: QueuedMessage = (message_id, sender, message)
+        result = {
+            "task_id": task_id,
+            "recipient": recipient,
+            "session_id": session_id,
+            "status": reply.status,
+            "summary": reply.summary,
+        }
+
+    # include errors in batch results -> other assignments continue
+    except Exception as error:
+        result = {
+            "task_id": task_id,
+            "recipient": recipient,
+            "session_id": session_id,
+            "status": "failed",
+            "summary": str(error),
+        }
+
+    #console print statement
+    print(
+        f"[{task_id}] {sender} -> {recipient} "
+        f"({session_id or 'no session'}) {result['status']}",
+        flush=True,
+    )
+
+    return result
+
+
+# delegate assignments -> wait for all results
+@mcp.tool()
+# await -> async func
+async def delegate(
+    sender: str,
+    assignments: list[Assignment],
+) -> dict[str, object]:
+    """
+    Delegate tasks using exact TrueForge agent names.
+
+    Different recipient agents work concurrently.
+    Assignments to the same agent run sequentially in its saved session.
+
+    Waits for every assignment to complete, request input, or fail.
+    Results return automatically through this tool call.
+    """
+    sender = sender.strip()
+
+    # validate incoming necessary info
+    if not sender or not assignments:
+        raise ValueError(
+            "Sender and at least one assignment must be provided."
+        )
+
+    # format and validate the entire batch before submitting work
+    normalized: list[tuple[str, str]] = []
+
+    for assignment in assignments:
+        recipient = assignment.recipient.strip()
+        message = assignment.message.strip()
+
+        if not recipient or not message:
+            raise ValueError(
+                "Every assignment needs a recipient and message."
+            )
+
+        normalized.append((recipient, message))
+
+    # recipient agent -> Future (tied to job request)
+    jobs: list[tuple[str, Future]] = []
 
     with state_lock:
-        # existing worker will process this message
-        if recipient in pending:
-            pending[recipient].append(queued_job)
-
-        else:
-            # create 1 worker for this agent if needed
-            if recipient not in executors:
-                executors[recipient] = ThreadPoolExecutor(
-                    max_workers=1,
+        # prevent self-delegation and circular waiting
+        for recipient, _ in normalized:
+            """
+            if the recipient has already delegated the sender, then
+            both agents wait on eachtother indefintely -> infinite loop
+            """
+            if has_wait_path(recipient, sender):
+                raise ValueError(
+                    f"Delegating from {sender} to {recipient} would "
+                    "create a circular wait. Return the question "
+                    "to the caller instead."
                 )
 
-            pending[recipient] = deque([queued_job])
+        for recipient, message in normalized:
+            task_id = uuid4().hex
+
+            # record this delgation assignments in `waiting_on`
+            recipients = waiting_on.setdefault(sender, {})
+            # # corresponds to the number of assignments outstanding
+            recipients[recipient] = recipients.get(recipient, 0) + 1
 
             try:
-                executors[recipient].submit(
-                    process_agent_jobs,
+                # create 1 worker for this agent if needed
+                if recipient not in executors:
+                    executors[recipient] = ThreadPoolExecutor(
+                        max_workers=1,
+                    )
+
+                # executor queues tasks for the same agent
+                job = executors[recipient].submit(
+                    run_assignment,
+                    task_id,
+                    sender,
                     recipient,
-                    session_id,
+                    message,
                 )
 
-            # submission failed -> remove queue so it can be retried
-            except RuntimeError:
-                del pending[recipient]
-                raise
+            # submission failed -> return a failed assignment result
+            except Exception as error:
+                job = Future()
+                job.set_result({
+                    "task_id": task_id,
+                    "recipient": recipient,
+                    "session_id": "",
+                    "status": "failed",
+                    "summary": str(error),
+                })
 
-    return {
-        "status": "queued",
-        "message_id": message_id,
-        "recipient": recipient,
-        "session_id": session_id,
-    }
+            #queue job to agent's worker
+            jobs.append((recipient, job))
 
-
-# register an existing conversation, such as the master-user session
-@mcp.tool()
-def register_agent_session(
-    agent_name: str,
-    ctx: Context,
-) -> dict[str, str]:
-    """
-    Register the calling TrueForge session under its exact agent name.
-
-    Call from the conversation that should receive future messages.
-    """
-    agent_name = agent_name.strip()
-
-    if not agent_name:
-        raise ValueError("Agent name must be provided.")
-
-    request = ctx.request_context.request
-
-    if request is None:
-        raise RuntimeError("No HTTP request context is available.")
-
-    session_id = request.headers.get("x-tfg-session-id")
-
-    if not session_id:
-        raise RuntimeError(
-            "TrueForge did not provide the calling session ID."
+    # attach callback to each job outside the lock -> completed jobs may call immediately asynclly
+    for recipient, job in jobs:
+        job.add_done_callback(
+            # removes waiting_on relationship between sender -> recipient
+            lambda finished, recipient=recipient: release_wait(
+                sender, recipient
+            )
         )
 
-    # coordinate registration with automatic session creation
-    with session_creation_lock:
-        with state_lock:
-            existing_session = sessions.get(agent_name)
+    # wait without blocking the MCP server's event loop
+    # shield prevents caller cancellation from cancelling queued assignments
+    results = await asyncio.gather(
+        #list of all asyncio protected futures -> `*` destructures list into seperate args for .gather
+        *[
+            #.wrap_future -> asyncio can recieve job's Future
+            #.sheild -> any submitted work is protected if delegation canceled/interupted
+            asyncio.shield(asyncio.wrap_future(job_future))
+            for _, job_future in jobs
+        ]
+    )
 
-            # prevent switching destinations while messages are pending
-            if (
-                existing_session != session_id
-                and agent_name in pending
-            ):
-                raise RuntimeError(
-                    f"Cannot replace {agent_name}'s session "
-                    "while its queue is active."
-                )
-
-            sessions[agent_name] = session_id
-
-    return {
-        "status": "registered",
-        "agent": agent_name,
-        "session_id": session_id,
-    }
+    #results contain all job responses (from run_assignment)
+    return {"results": results}
 
 
 # run HTTP server -> exposes the MCP tools
